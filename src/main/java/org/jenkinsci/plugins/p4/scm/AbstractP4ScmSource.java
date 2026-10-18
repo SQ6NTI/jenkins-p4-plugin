@@ -2,6 +2,7 @@ package org.jenkinsci.plugins.p4.scm;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Util;
 import hudson.model.Action;
 import hudson.model.TaskListener;
@@ -21,7 +22,7 @@ import jenkins.scm.api.trait.SCMSourceTrait;
 import jenkins.scm.impl.ChangeRequestSCMHeadCategory;
 import jenkins.scm.impl.TagSCMHeadCategory;
 import net.sf.json.JSONObject;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.plugins.p4.PerforceScm;
 import org.jenkinsci.plugins.p4.browsers.P4Browser;
 import org.jenkinsci.plugins.p4.changes.P4ChangeRef;
@@ -36,6 +37,7 @@ import org.jenkinsci.plugins.p4.filters.FilterPerChangeImpl;
 import org.jenkinsci.plugins.p4.populate.Populate;
 import org.jenkinsci.plugins.p4.review.ReviewProp;
 import org.jenkinsci.plugins.p4.scm.events.P4BranchScanner;
+import org.jenkinsci.plugins.p4.utils.FolderPropertiesUtil;
 import org.jenkinsci.plugins.p4.workspace.Workspace;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
@@ -158,11 +160,9 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 
 	public String getScriptPathOrDefault() {
 		SCMSourceOwner owner = getOwner();
-		if (owner instanceof WorkflowMultiBranchProject) {
-			WorkflowMultiBranchProject branchProject = (WorkflowMultiBranchProject) owner;
+		if (owner instanceof WorkflowMultiBranchProject branchProject) {
 			BranchProjectFactory<WorkflowJob, WorkflowRun> project = branchProject.getProjectFactory();
-			if (project instanceof WorkflowBranchProjectFactory) {
-				WorkflowBranchProjectFactory branchProjectFactory = (WorkflowBranchProjectFactory) project;
+			if (project instanceof WorkflowBranchProjectFactory branchProjectFactory) {
 				return branchProjectFactory.getScriptPath();
 			}
 		}
@@ -170,7 +170,7 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 	}
 
 	@Override
-	protected void retrieve(@CheckForNull SCMSourceCriteria criteria, @NonNull SCMHeadObserver observer, @CheckForNull SCMHeadEvent<?> event, @NonNull TaskListener listener) throws IOException, InterruptedException {
+	protected void retrieve(@CheckForNull SCMSourceCriteria criteria, @NonNull SCMHeadObserver observer, @CheckForNull SCMHeadEvent<?> event, @NonNull TaskListener listener) throws IOException {
 		try (TempClientHelper p4 = new TempClientHelper(getOwner(), credential, listener, null)) {
 			List<P4SCMHead> heads = getP4SCMHeads(observer, listener);
 			for (P4SCMHead head : heads) {
@@ -180,6 +180,18 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 		} catch (Exception e) {
 			throw new IOException(e);
 		}
+	}
+
+	public boolean pathContainsFolderPropertyVar(List<String> paths) {
+		if (paths == null || paths.isEmpty()) {
+			return false;
+		}
+		for (String path : paths) {
+			if (path.contains(FolderPropertiesUtil.PROP_EXPANSION_PATTERN)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private List<P4SCMHead> getP4SCMHeads(SCMHeadObserver observer, TaskListener listener) throws Exception {
@@ -252,13 +264,15 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 		return null;
 	}
 
-
+	@NonNull
 	@Override
 	protected SCMProbe createProbe(@NonNull SCMHead head, @CheckForNull SCMRevision revision) throws IOException {
 		return newProbe(head, revision);
 	}
 
+	@NonNull
 	@Override
+	@SuppressFBWarnings("NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE")
 	public PerforceScm build(@NonNull SCMHead head, @CheckForNull SCMRevision revision) {
 		return new P4SCMBuilder(this, head, revision).withTraits(getTraits()).build();
 	}
@@ -269,12 +283,10 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 	 * @param event    Optional event (might be null) use payload to help filter calls.
 	 * @param listener the listener to report progress on.
 	 * @return the list of {@link Action} instances to persist.
-	 * @throws IOException          if an error occurs while performing the operation.
-	 * @throws InterruptedException if any thread has interrupted the current thread.
 	 */
+	@NonNull
 	@Override
-	protected List<Action> retrieveActions(@CheckForNull SCMSourceEvent event, @NonNull TaskListener listener)
-			throws IOException, InterruptedException {
+	protected List<Action> retrieveActions(@CheckForNull SCMSourceEvent event, @NonNull TaskListener listener) {
 		List<Action> result = new ArrayList<>();
 
 		return result;
@@ -290,6 +302,7 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 	 * @throws IOException          if an error occurs while performing the operation.
 	 * @throws InterruptedException if any thread has interrupted the current thread.
 	 */
+	@NonNull
 	@Override
 	protected List<Action> retrieveActions(@NonNull SCMHead head, @CheckForNull SCMHeadEvent event, @NonNull TaskListener listener) throws IOException, InterruptedException {
 		List<Action> result = new ArrayList<>();
@@ -304,11 +317,10 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 	 * @param event    Optional event (might be null) use payload to help filter calls.
 	 * @param listener the listener to report progress on.
 	 * @return the list of {@link Action} instances to persist.
-	 * @throws IOException          if an error occurs while performing the operation.
-	 * @throws InterruptedException if any thread has interrupted the current thread.
 	 */
+	@NonNull
 	@Override
-	protected List<Action> retrieveActions(@NonNull SCMRevision revision, @CheckForNull SCMHeadEvent event, @NonNull TaskListener listener) throws IOException, InterruptedException {
+	protected List<Action> retrieveActions(@NonNull SCMRevision revision, @CheckForNull SCMHeadEvent event, @NonNull TaskListener listener) {
 		List<Action> result = new ArrayList<>();
 
 		return result;
@@ -414,7 +426,7 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 					continue;
 				}
 				long c = p4.getHead(map, fromRef, toRef);
-				change = (c > change) ? c : change;
+				change = Math.max(c, change);
 			}
 		}
 		return change;
@@ -444,13 +456,13 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 		P4Ref fromRef = new P4ChangeRef(change + 1);
 
 		long c = p4.getLowestHead(path.getPath() + "/...", fromRef, toRef);
-		change = (c > change) ? c : change;
+		change = Math.max(c, change);
 
 		List<String> maps = path.getMappings();
 		if (maps != null && !maps.isEmpty()) {
 			for (String map : maps) {
 				c = p4.getLowestHead(map, fromRef, toRef);
-				change = (c > change) ? c : change;
+				change = Math.max(c, change);
 			}
 		}
 		return change;
@@ -464,14 +476,12 @@ public abstract class AbstractP4ScmSource extends SCMSource {
 	 */
 	private P4SCMRevision getLastScan(P4SCMHead head) {
 		SCMSourceOwner owner = getOwner();
-		if (!(owner instanceof WorkflowMultiBranchProject)) {
+		if (!(owner instanceof WorkflowMultiBranchProject branchProject)) {
 			return null;
 		}
 
-		WorkflowMultiBranchProject branchProject = (WorkflowMultiBranchProject) owner;
 		BranchProjectFactory<WorkflowJob, WorkflowRun> project = branchProject.getProjectFactory();
-		if (project instanceof WorkflowBranchProjectFactory) {
-			WorkflowBranchProjectFactory branchProjectFactory = (WorkflowBranchProjectFactory) project;
+		if (project instanceof WorkflowBranchProjectFactory branchProjectFactory) {
 			WorkflowJob job = branchProject.getJob(head.getName());
 
 			if (job == null) {

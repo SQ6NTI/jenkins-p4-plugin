@@ -5,10 +5,12 @@ import hudson.ExtensionPoint;
 import hudson.model.Describable;
 import jenkins.model.Jenkins;
 
+import java.io.Serial;
 import java.io.Serializable;
 
 public abstract class Publish implements ExtensionPoint, Describable<Publish>, Serializable {
 
+	@Serial
 	private static final long serialVersionUID = 1L;
 
 	private final String description;
@@ -18,6 +20,9 @@ public abstract class Publish implements ExtensionPoint, Describable<Publish>, S
 
 	private String expandedDesc;
 	private String paths;
+
+	// Whether reconcile passes '-t'. Boxed so pre-existing configs (null) default to true via isFileType().
+	private Boolean fileType;
 
 	public String getDescription() {
 		return description;
@@ -43,13 +48,13 @@ public abstract class Publish implements ExtensionPoint, Describable<Publish>, S
 	}
 
 	public PublishDescriptor getDescriptor() {
-		Jenkins j = Jenkins.getInstance();
+		Jenkins j = Jenkins.get();
 		return (PublishDescriptor) j.getDescriptor(getClass());
 	}
 
 	public static DescriptorExtensionList<Publish, PublishDescriptor> all() {
-		Jenkins j = Jenkins.getInstance();
-		return j.<Publish, PublishDescriptor> getDescriptorList(Publish.class);
+		Jenkins j = Jenkins.get();
+		return j.getDescriptorList(Publish.class);
 	}
 
 	public String getExpandedDesc() {
@@ -66,5 +71,13 @@ public abstract class Publish implements ExtensionPoint, Describable<Publish>, S
 
 	public String getPaths() {
 		return paths;
+	}
+
+	public boolean isFileType() {
+		return fileType == null || fileType;
+	}
+
+	protected void setFileType(boolean fileType) {
+		this.fileType = fileType;
 	}
 }

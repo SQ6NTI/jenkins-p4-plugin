@@ -1,22 +1,28 @@
 package org.jenkinsci.plugins.p4.populate;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
 
+import java.io.Serial;
+
 public class AutoCleanImpl extends Populate {
 
+	@Serial
 	private static final long serialVersionUID = 1L;
 
 	private final boolean replace;
 	private final boolean delete;
 	private final boolean tidy;
+	private final boolean modtime;
 
 	@DataBoundConstructor
 	public AutoCleanImpl(boolean replace, boolean delete, boolean tidy, boolean modtime, boolean quiet, String pin,
 			ParallelSync parallel) {
 		// normal sync; no -f, no -p
-		super(true, false, modtime, quiet, pin, parallel);
+		super(true, false, quiet, pin, parallel);
+		this.modtime = modtime;
 		this.replace = replace;
 		this.delete = delete;
 		this.tidy = tidy;
@@ -30,10 +36,16 @@ public class AutoCleanImpl extends Populate {
 
 	// Default for test cases
 	public AutoCleanImpl() {
-		super(true, true, false, false, null, null);
+		super(true, true, false, null, null);
+		this.modtime = false;
 		this.replace = false;
 		this.delete = false;
 		this.tidy = false;
+	}
+
+
+	public boolean isModtime() {
+		return modtime;
 	}
 
 	public boolean isReplace() {
@@ -52,6 +64,7 @@ public class AutoCleanImpl extends Populate {
 	@Symbol("autoClean")
 	public static final class DescriptorImpl extends PopulateDescriptor {
 
+		@NonNull
 		@Override
 		public String getDisplayName() {
 			return "Auto cleanup and sync";

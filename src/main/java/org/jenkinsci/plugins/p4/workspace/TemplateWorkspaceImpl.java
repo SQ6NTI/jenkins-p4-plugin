@@ -12,11 +12,13 @@ import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 
+import java.io.Serial;
 import java.io.Serializable;
 import java.util.logging.Logger;
 
 public class TemplateWorkspaceImpl extends Workspace implements Serializable {
 
+	@Serial
 	private static final long serialVersionUID = 1L;
 
 	private final String templateName;
@@ -77,6 +79,7 @@ public class TemplateWorkspaceImpl extends Workspace implements Serializable {
 			Client implClient = new Client(connection);
 			implClient.setName(clientName);
 			implClient.setOwnerName(user);
+			implClient.setType(itemplate.getType());
 			connection.createClient(implClient);
 			iclient = connection.getClient(clientName);
 			// Root required to switch view; must reload values in iclient.

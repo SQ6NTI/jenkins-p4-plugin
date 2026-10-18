@@ -7,6 +7,7 @@ import hudson.model.TaskListener;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.p4.browsers.P4Browser;
 import org.jenkinsci.plugins.p4.client.ConnectionHelper;
+import org.jenkinsci.plugins.p4.utils.FolderPropertiesUtil;
 import org.jenkinsci.plugins.p4.workspace.StreamWorkspaceImpl;
 import org.jenkinsci.plugins.p4.workspace.Workspace;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -40,15 +41,18 @@ public class StreamsScmSource extends AbstractP4ScmSource {
 	}
 
 	@Override
-	public List<P4SCMHead> getTags(@NonNull TaskListener listener) throws Exception {
+	public List<P4SCMHead> getTags(@NonNull TaskListener listener) {
 		return new ArrayList<>();
 	}
 
 	@Override
 	public List<P4SCMHead> getHeads(@NonNull TaskListener listener) throws Exception {
 		List<String> paths = getIncludePaths();
-		HashSet<P4SCMHead> list = new HashSet<P4SCMHead>();
 
+		if (pathContainsFolderPropertyVar(paths)) {
+			paths = FolderPropertiesUtil.processFolderPropertiesIn(paths, getOwner());
+		}
+		HashSet<P4SCMHead> list = new HashSet<>();
 		try (ConnectionHelper p4 = new ConnectionHelper(getOwner(), credential, listener)) {
 
 			Pattern excludesPattern = Pattern.compile(getExcludes());
@@ -81,6 +85,7 @@ public class StreamsScmSource extends AbstractP4ScmSource {
 	@Symbol("multiStreams")
 	public static final class DescriptorImpl extends P4SCMSourceDescriptor {
 
+		@NonNull
 		@Override
 		public String getDisplayName() {
 			return "Helix Streams";

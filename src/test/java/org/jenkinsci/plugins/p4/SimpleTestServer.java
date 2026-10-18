@@ -17,22 +17,29 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class SimpleTestServer {
 
-	private static Logger logger = LoggerFactory.getLogger(SimpleTestServer.class);
+	private static final Logger LOGGER = LoggerFactory.getLogger(SimpleTestServer.class);
 
 	private static final String RESOURCES = "src/test/resources/";
+
+	// On Windows the rsh p4d process can keep its db.* files locked for a while after it starts exiting,
+	// so wiping the p4root needs a much longer retry window there. Linux can delete open files and passes
+	// on the first try, so the small window is fine.
+	private static final boolean IS_WINDOWS = System.getProperty("os.name").toLowerCase().contains("win");
+	private static final int CLEANUP_RETRIES = IS_WINDOWS ? 120 : 30;       // ~60s on Windows, ~15s elsewhere
+	private static final long CLEANUP_RETRY_SLEEP_MS = 500L;
 
 	private final String p4d;
 	private final File p4root;
 	private final String p4ver;
 
 	public SimpleTestServer(String root, String version) {
-		String p4d = new File(RESOURCES + version).getAbsolutePath().toString();
+		String p4d = new File(RESOURCES + version).getAbsolutePath();
 		String os = System.getProperty("os.name").toLowerCase();
 		if (os.contains("win")) {
 			p4d += "/bin.ntx64/p4d.exe";
@@ -81,10 +88,10 @@ public class SimpleTestServer {
 		tarIn = new TarArchiveInputStream(
 				new GzipCompressorInputStream(new BufferedInputStream(new FileInputStream(archive))));
 
-		TarArchiveEntry tarEntry = tarIn.getNextTarEntry();
+		TarArchiveEntry tarEntry = tarIn.getNextEntry();
 		while (tarEntry != null) {
 			File node = new File(p4root, tarEntry.getName());
-			logger.debug("extracting: " + node.getCanonicalPath());
+      		LOGGER.debug("extracting: {}", node.getCanonicalPath());
 			if (tarEntry.isDirectory()) {
 				node.mkdirs();
 			} else {
@@ -98,14 +105,34 @@ public class SimpleTestServer {
 				}
 				bout.close();
 			}
-			tarEntry = tarIn.getNextTarEntry();
+			tarEntry = tarIn.getNextEntry();
 		}
 		tarIn.close();
 	}
 
 	public void clean() throws IOException {
 		if (p4root.exists()) {
-			FileUtils.cleanDirectory(p4root);
+			// On Windows the rsh p4d process spawned by the previous test may still be
+			// exiting and holding its db.* files when the next test starts; retry until
+			// the OS releases the handles (Linux can delete open files, so it passes first try).
+			int count = CLEANUP_RETRIES;
+			while (true) {
+				try {
+					FileUtils.cleanDirectory(p4root);
+					return;
+				} catch (IOException e) {
+					if (--count <= 0) {
+						throw e;
+					}
+					System.gc(); // nudge the JVM to release any lingering handles before retrying
+					try {
+						Thread.sleep(CLEANUP_RETRY_SLEEP_MS);
+					} catch (InterruptedException ie) {
+						Thread.currentThread().interrupt();
+						throw new IOException(ie);
+					}
+				}
+			}
 		} else {
 			p4root.mkdir();
 		}
@@ -113,9 +140,10 @@ public class SimpleTestServer {
 
 	public void destroy() throws Exception {
 		if (p4root.exists()) {
-			int count = 5;
+			int count = CLEANUP_RETRIES;
 			while(!tryDestroy() && count > 0) {
-				Thread.sleep(200);
+				System.gc(); // nudge the JVM to release any lingering handles before retrying
+				Thread.sleep(CLEANUP_RETRY_SLEEP_MS);
 				count --;
 			}
 		}
@@ -140,7 +168,7 @@ public class SimpleTestServer {
 		executor.execute(cmdLine);
 
 		int version = 0;
-		for (String line : outputStream.toString(Charset.forName("UTF-8")).split("\\n")) {
+		for (String line : outputStream.toString(StandardCharsets.UTF_8).split("\\n")) {
 			if (line.startsWith("Rev. P4D")) {
 				Pattern p = Pattern.compile("\\d{4}\\.\\d{1}");
 				Matcher m = p.matcher(line);
@@ -151,7 +179,7 @@ public class SimpleTestServer {
 				}
 			}
 		}
-		logger.info("P4D Version: " + version);
+    	LOGGER.info("P4D Version: {}", version);
 		return version;
 	}
 
@@ -164,7 +192,7 @@ public class SimpleTestServer {
 			cmdLine.addArgument(arg);
 		}
 
-		logger.debug("EXEC: " + cmdLine.toString());
+    	LOGGER.debug("EXEC: {}", cmdLine);
 
 		DefaultExecutor executor = new DefaultExecutor();
 		return executor.execute(cmdLine);

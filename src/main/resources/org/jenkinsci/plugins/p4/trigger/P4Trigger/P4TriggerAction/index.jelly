@@ -3,7 +3,7 @@
     <l:layout>
         <st:include it="${it.owner}" page="sidepanel.jelly" />
         <l:main-panel>
-            <h1>${%Last Perforce Change}</h1>
+            <h1>${%Last P4 Change}</h1>
             <j:set var="log" value="${it.log}" />
             <j:choose>
                 <j:when test="${empty(log)}">
@@ -11,7 +11,6 @@
                 </j:when>
                 <j:otherwise>
                 	<link rel="stylesheet" href="${rootURL}/plugin/p4/style.css"></link>
-                	<script type="text/javascript" src="${rootURL}/plugin/p4/script.js"></script>
                     <pre>
                         <st:getOutput var="output" />
                         <j:whitespace>${it.writeLogTo(output)}</j:whitespace>

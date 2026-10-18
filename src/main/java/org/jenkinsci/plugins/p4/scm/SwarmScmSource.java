@@ -22,6 +22,7 @@ import org.jenkinsci.plugins.p4.changes.P4RefBuilder;
 import org.jenkinsci.plugins.p4.client.ConnectionHelper;
 import org.jenkinsci.plugins.p4.client.TempClientHelper;
 import org.jenkinsci.plugins.p4.client.ViewMapHelper;
+import org.jenkinsci.plugins.p4.review.ReviewProp;
 import org.jenkinsci.plugins.p4.scm.events.P4BranchScanner;
 import org.jenkinsci.plugins.p4.swarmAPI.SwarmHelper;
 import org.jenkinsci.plugins.p4.swarmAPI.SwarmProjectAPI;
@@ -36,8 +37,10 @@ import org.kohsuke.stapler.DataBoundSetter;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
@@ -57,7 +60,7 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 	transient private SwarmHelper swarm;
 
 	@DataBoundConstructor
-	public SwarmScmSource(String credential, String charset, String format) throws Exception {
+	public SwarmScmSource(String credential, String charset, String format) {
 		super(credential);
 
 		setCharset(charset);
@@ -95,11 +98,12 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 		}
 	}
 
+	@NonNull
 	@Override
-	protected List<Action> retrieveActions(SCMHead head, SCMHeadEvent event, TaskListener listener) throws IOException, InterruptedException {
+	protected List<Action> retrieveActions(@NonNull SCMHead head, SCMHeadEvent event, @NonNull TaskListener listener) throws IOException, InterruptedException {
+		logger.fine("Retrieving actions for " + head);
 		List<Action> actions = super.retrieveActions(head, event, listener);
-		if (head instanceof P4ChangeRequestSCMHead) {
-			P4ChangeRequestSCMHead scmHead = ((P4ChangeRequestSCMHead)head);
+		if (head instanceof P4ChangeRequestSCMHead scmHead) {
 			try {
 				String changeUrl = getSwarm().getBaseUrl() + "/reviews/" + scmHead.getId();
 				actions.add(new ObjectMetadataAction(scmHead.getName(), null, changeUrl));
@@ -116,7 +120,7 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 
 	@Override
 	public List<P4SCMHead> getTags(@NonNull TaskListener listener) throws Exception {
-
+		logger.info("Getting tags for " + project);
 		Pattern excludesPattern = Pattern.compile(getExcludes());
 
 		List<P4SCMHead> list = new ArrayList<>();
@@ -138,7 +142,10 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 					p4Path.setRevision(reviewID);
 
 					P4SCMHead target = new P4SCMHead(reviewID, p4Path);
+					Map<String, String> swarmParameters = Collections.singletonMap(ReviewProp.SWARM_BRANCH.toString(), branch);
+					target.setSwarmParams(swarmParameters);
 					P4ChangeRequestSCMHead tag = new P4ChangeRequestSCMHead(reviewID, reviewID, p4Path, target, review.getAuthor());
+					tag.setSwarmParams(swarmParameters);
 					list.add(tag);
 				}
 			}
@@ -149,7 +156,7 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 
 	@Override
 	public List<P4SCMHead> getHeads(@NonNull TaskListener listener) throws Exception {
-
+		logger.info("Getting heads for " + project);
 		Pattern excludesPattern = Pattern.compile(getExcludes());
 
 		List<P4SCMHead> list = new ArrayList<>();
@@ -166,6 +173,8 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 			P4Path p4Path = branch.getPath();
 
 			P4SCMHead head = new P4SCMHead(branch.getName(), p4Path);
+			Map<String, String> swarmParameters = Collections.singletonMap(ReviewProp.SWARM_BRANCH.toString(), branch.getName());
+			head.setSwarmParams(swarmParameters);
 			list.add(head);
 		}
 
@@ -174,8 +183,7 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 
 	@Override
 	public P4SCMRevision getRevision(TempClientHelper p4, P4SCMHead head) throws Exception {
-		if (head instanceof P4ChangeRequestSCMHead) {
-			P4ChangeRequestSCMHead changeRequest = (P4ChangeRequestSCMHead) head;
+		if (head instanceof P4ChangeRequestSCMHead changeRequest) {
 			String review = changeRequest.getReview();
 			long change = getLastChangeInReview(review);
 
@@ -193,7 +201,6 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 	 */
 	@Override
 	public P4SCMRevision getRevision(JSONObject payload) {
-
 		// Verify Change is set in JSON
 		String change = getProperty(payload, P4_CHANGE);
 		if (change == null) {
@@ -205,9 +212,7 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 
 		// If project is not defined; try probing with non-Swarm event on Swarm Source
 		if (project == null || !project.equalsIgnoreCase(getProject())) {
-
 			P4Ref ref = P4RefBuilder.get(change);
-
 			P4BranchScanner scanner = getScanner(ref);
 			if (scanner == null) {
 				return null;
@@ -216,16 +221,33 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 			String base = scanner.getProjectRoot();
 			String branch = scanner.getBranch();
 			String path = base + "/" + branch;
+
 			return P4SCMRevision.swarmBuilder(path, branch, ref);
 		}
 
-		// Project is defined so look up in Swarm
 		String branch = getProperty(payload, SWARM_BRANCH);
 		String path = getProperty(payload, SWARM_PATH);
 		String status = getProperty(payload, SWARM_STATUS);
-
 		if (branch == null || path == null || status == null) {
 			return null;
+		}
+
+		boolean projectFound = false;
+		try {
+			// Validate project exists in Swarm
+			projectFound = getSwarm().getProjects().contains(project);
+			if (!projectFound) {
+				return null;
+			}
+
+			// Verify branch exists in the given Swarm project
+			List<SwarmProjectAPI.Branch> branches = getSwarm().getBranchesInProject(project);
+			boolean branchFound = branches.stream().anyMatch(b -> branch.equals(b.getName()));
+			if (!branchFound) {
+				return null;
+			}
+		} catch (Exception e) {
+			throw new RuntimeException("Unable to fetch branches in the Swarm project / branches: " + e);
 		}
 
 		CheckoutStatus checkoutStatus = CheckoutStatus.parse(status);
@@ -330,6 +352,7 @@ public class SwarmScmSource extends AbstractP4ScmSource {
 	@Symbol("multiSwarm")
 	public static final class DescriptorImpl extends P4SCMSourceDescriptor {
 
+		@NonNull
 		@Override
 		public String getDisplayName() {
 			return "Helix Swarm";

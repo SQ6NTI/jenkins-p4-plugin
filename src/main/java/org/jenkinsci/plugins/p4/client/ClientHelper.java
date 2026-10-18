@@ -6,6 +6,7 @@ import com.perforce.p4java.client.IClientViewMapping;
 import com.perforce.p4java.core.IChangelist;
 import com.perforce.p4java.core.IChangelistSummary;
 import com.perforce.p4java.core.IRepo;
+import com.perforce.p4java.core.IStreamSummary;
 import com.perforce.p4java.core.file.FileAction;
 import com.perforce.p4java.core.file.FileSpecBuilder;
 import com.perforce.p4java.core.file.FileSpecOpStatus;
@@ -80,7 +81,6 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
-import java.util.stream.Collectors;
 
 import static org.jenkinsci.plugins.p4.console.P4ConsoleAnnotator.COMMAND;
 import static org.jenkinsci.plugins.p4.console.P4ConsoleAnnotator.STOP;
@@ -174,7 +174,7 @@ public class ClientHelper extends ConnectionHelper {
 			StringWriter writer = new StringWriter();
 			PrintWriter printWriter = new PrintWriter(writer);
 			e.printStackTrace(printWriter);
-			String err = "P4: Unable to setup workspace: " + writer.toString();
+			String err = "P4: Unable to setup workspace: " + writer;
 			logger.severe(err);
 			log(err);
 			throw new AbortException(e.getMessage());
@@ -195,7 +195,7 @@ public class ClientHelper extends ConnectionHelper {
 
 		// Log client view...
 		if (clientView != null) {
-			StringBuffer sb = new StringBuffer("...   View:\n");
+			StringBuilder sb = new StringBuilder("...   View:\n");
 			for (IClientViewMapping view : clientView) {
 				sb.append("      ");
 				if (view.getType() != null)
@@ -257,7 +257,7 @@ public class ClientHelper extends ConnectionHelper {
 		// convert int fields
 		String[] intFields = new String[]{"StreamAtChange"};
 		for (String key : intFields) {
-			Object value=map.remove(key);
+			Object value = map.remove(key);
 			if (value != null) {
 				map.put(key, value.toString());
 			}
@@ -282,10 +282,7 @@ public class ClientHelper extends ConnectionHelper {
 		if (services.contains("workspace-server")) {
 			return true;
 		}
-		if (services.contains("build-server")) {
-			return true;
-		}
-		return false;
+		return services.contains("build-server");
 	}
 
 	// TODO remove when P4Java has support for 'serverServices'
@@ -351,7 +348,7 @@ public class ClientHelper extends ConnectionHelper {
 			syncFiles(rev, populate);
 		}
 
-		log("duration: " + timer.toString() + "\n");
+		log("duration: " + timer + "\n");
 	}
 
 	/**
@@ -407,7 +404,7 @@ public class ClientHelper extends ConnectionHelper {
 	private void syncFiles(String revisions, Populate populate) throws Exception {
 
 		// set MODTIME if populate options is used only required before 15.1
-		if (populate.isModtime() && !checkVersion(20151)) {
+		if( (populate instanceof AutoCleanImpl)  && ((AutoCleanImpl) populate).isModtime() && !checkVersion(20151) ) {
 			IClientOptions options = iclient.getOptions();
 			if (!options.isModtime()) {
 				options.setModtime(true);
@@ -418,14 +415,7 @@ public class ClientHelper extends ConnectionHelper {
 		}
 
 		// sync options
-		SyncOptions syncOpts = new SyncOptions();
-
-		// setServerBypass (-p no have list)
-		syncOpts.setServerBypass(!populate.isHave());
-
-		// setForceUpdate (-f only if no -p is set)
-		syncOpts.setForceUpdate(populate.isForce() && populate.isHave());
-		syncOpts.setQuiet(populate.isQuiet());
+		SyncOptions syncOpts = buildSyncOptions(populate);
 
 		// Sync files with asynchronous callback and parallel if enabled to
 		SyncStreamingCallback callback = new SyncStreamingCallback(iclient.getServer(), getListener());
@@ -433,10 +423,15 @@ public class ClientHelper extends ConnectionHelper {
 			List<IFileSpec> files = FileSpecBuilder.makeFileSpecList(revisions);
 
 			ParallelSync parallel = populate.getParallel();
-			if (parallel != null && parallel.isEnable()) {
+			if (useParallelSync(populate)) {
 				ParallelSyncOptions parallelOpts = parallel.getParallelOptions();
 				iclient.syncParallel(files, syncOpts, callback, 0, parallelOpts);
 			} else {
+				if (parallel != null && parallel.isEnable() && syncOpts.isServerBypass()) {
+					// P4JENKINS-184: parallel + -p (bypass) drops content on read-only
+					// replicas; fall back to a serial sync so files are actually written.
+					log("P4: parallel sync disabled for -p (populate/bypass) sync; using serial transfer.");
+				}
 				iclient.sync(files, syncOpts, callback, 0);
 			}
 
@@ -448,6 +443,54 @@ public class ClientHelper extends ConnectionHelper {
 				throw new P4JavaException(callback.getException());
 			}
 		}
+	}
+
+	/**
+	 * Translate a {@link Populate} strategy into p4java {@link SyncOptions}.
+	 *
+	 * <p>Extracted from {@link #syncFiles} (its only caller) so the -p/-f/-q flag
+	 * matrix can be asserted in a fast, deterministic unit test without a live
+	 * server. Note -f and -p are mutually exclusive in 'p4 sync' (the server rejects
+	 * the combination with "Usage: sync [ -K -n -N -p -q ]"), so -f is only sent
+	 * when the have list is being maintained.
+	 *
+	 * @param populate Populate options
+	 * @return SyncOptions with the equivalent -p/-f/-q flags
+	 */
+	static SyncOptions buildSyncOptions(Populate populate) {
+		SyncOptions syncOpts = new SyncOptions();
+
+		// setServerBypass (-p, "Populate have list" unchecked)
+		syncOpts.setServerBypass(!populate.isHave());
+
+		// setForceUpdate (-f) only when -p is NOT used; the two flags are mutually
+		// exclusive in 'p4 sync'.
+		syncOpts.setForceUpdate(populate.isForce() && populate.isHave());
+		syncOpts.setQuiet(populate.isQuiet());
+
+		return syncOpts;
+	}
+
+	/**
+	 * Whether the sync should use parallel transfer.
+	 *
+	 * <p>Parallel sync is skipped whenever the have list is bypassed (-p, have=false).
+	 * A parallel sync combined with -p (ServerBypass) does not honor the server's
+	 * {@code doPublish} directive on a read-only / forwarding replica: the delegated
+	 * transmit workers deliver 0 files while the console still reports every file as
+	 * synced, leaving the workspace empty (P4JENKINS-184). Falling back to a serial
+	 * sync transfers the archive content correctly and preserves -p's "do not update
+	 * have list" semantics -- unlike a flag change it does not alter the have-table
+	 * behaviour of any existing job. The trigger is the actual bug condition
+	 * (parallel enabled + bypass), independent of whether a force was requested.
+	 *
+	 * @param populate Populate options
+	 * @return true only when parallel is enabled and the have list is maintained
+	 */
+	static boolean useParallelSync(Populate populate) {
+		ParallelSync parallel = populate.getParallel();
+		boolean enabled = parallel != null && parallel.isEnable();
+		return enabled && populate.isHave();
 	}
 
 	/**
@@ -522,7 +565,7 @@ public class ClientHelper extends ConnectionHelper {
 
 			List<Path> pathsToDelete = Files.walk(pathToDelete)
 					.sorted(Comparator.reverseOrder())
-					.collect(Collectors.toList());
+					.toList();
 			boolean success = true;
 			for (Path path : pathsToDelete) {
 				try {
@@ -577,7 +620,7 @@ public class ClientHelper extends ConnectionHelper {
 				}
 			}
 		}
-		log("duration: " + timer.toString() + "\n");
+		log("duration: " + timer + "\n");
 	}
 
 	private void tidyClean(Populate populate, String path) throws Exception {
@@ -609,7 +652,7 @@ public class ClientHelper extends ConnectionHelper {
 		}
 
 		// set MODTIME if populate options is used and server supports flag
-		if (populate.isModtime()) {
+		if ( (populate instanceof AutoCleanImpl)  && ((AutoCleanImpl) populate).isModtime() ) {
 			if (checkVersion(20141)) {
 				cleanOpts.setCheckModTime(true);
 			} else {
@@ -635,7 +678,7 @@ public class ClientHelper extends ConnectionHelper {
 			}
 		}
 
-		log("duration: " + timer.toString() + "\n");
+		log("duration: " + timer + "\n");
 	}
 
 	private void tidyRevisions(String path, Populate populate) throws Exception {
@@ -647,10 +690,9 @@ public class ClientHelper extends ConnectionHelper {
 
 		// check status - find all missing, changed or added files
 		String[] base = {"-n", "-a", "-e", "-d", "-l", "-f"};
-		List<String> list = new ArrayList<String>();
-		list.addAll(Arrays.asList(base));
+		List<String> list = new ArrayList<>(Arrays.asList(base));
 
-		String[] args = list.toArray(new String[list.size()]);
+		String[] args = list.toArray(new String[0]);
 		ReconcileFilesOptions statusOpts = new ReconcileFilesOptions(args);
 
 		List<IFileSpec> files = FileSpecBuilder.makeFileSpecList(path);
@@ -660,7 +702,7 @@ public class ClientHelper extends ConnectionHelper {
 
 		// Add missing, modified or locked files to a list, and delete the
 		// unversioned files.
-		List<IFileSpec> update = new ArrayList<IFileSpec>();
+		List<IFileSpec> update = new ArrayList<>();
 		for (IFileSpec s : status) {
 			if (s.getOpStatus() == FileSpecOpStatus.VALID) {
 				String local = s.getLocalPathString();
@@ -700,7 +742,7 @@ public class ClientHelper extends ConnectionHelper {
 			List<IFileSpec> syncMsg = iclient.sync(update, syncOpts);
 			getValidate().check(syncMsg, "file(s) up-to-date.", "file does not exist");
 		}
-		log("duration: " + timer.toString() + "\n");
+		log("duration: " + timer + "\n");
 	}
 
 	public void revertAllFiles(boolean virtual) throws Exception {
@@ -717,7 +759,7 @@ public class ClientHelper extends ConnectionHelper {
 	public void versionFile(String file, Publish publish, int ChangelistID, boolean submit) throws Exception {
 		// build file revision spec
 		List<IFileSpec> files = FileSpecBuilder.makeFileSpecList(file);
-		findChangeFiles(files, publish.isDelete(), publish.isModtime());
+		findChangeFiles(files, publish.isDelete(), publish.isModtime(), publish.isFileType());
 
 		// Exit early if no change
 		if (!isOpened(files)) {
@@ -738,8 +780,7 @@ public class ClientHelper extends ConnectionHelper {
 		log("P4 Task: reconcile files to changelist.");
 
 		List<IFileSpec> files;
-		if (publish instanceof CommitImpl) {
-			CommitImpl commit = (CommitImpl) publish;
+		if (publish instanceof CommitImpl commit) {
 			files = FileSpecBuilder.makeFileSpecList(commit.getFiles());
 			AddFilesOptions opts = new AddFilesOptions();
 			iclient.addFiles(files, opts);
@@ -750,13 +791,13 @@ public class ClientHelper extends ConnectionHelper {
 			List<String> paths = buildPaths(publish, clientBase);
 
 			files = FileSpecBuilder.makeFileSpecList(paths);
-			findChangeFiles(files, publish.isDelete(), publish.isModtime());
+			findChangeFiles(files, publish.isDelete(), publish.isModtime(), publish.isFileType());
 		}
 
 		// Check if file is open
 		boolean open = isOpened(files);
 
-		log("duration: " + timer.toString() + "\n");
+		log("duration: " + timer + "\n");
 		return open;
 	}
 
@@ -780,7 +821,7 @@ public class ClientHelper extends ConnectionHelper {
 		return list;
 	}
 
-	private void findChangeFiles(List<IFileSpec> files, boolean delete, boolean modtime) throws Exception {
+	private void findChangeFiles(List<IFileSpec> files, boolean delete, boolean modtime, boolean fileType) throws Exception {
 		// cleanup pending changes (revert -k)
 		RevertFilesOptions revertOpts = new RevertFilesOptions();
 		revertOpts.setNoClientRefresh(true);
@@ -801,7 +842,7 @@ public class ClientHelper extends ConnectionHelper {
 		statusOpts.setOutsideEdit(true);
 		statusOpts.setRemoved(delete);
 		if (checkVersion(20191)) {
-			statusOpts.setFileType(true);
+			statusOpts.setFileType(fileType);
 		}
 
 		List<IFileSpec> status = iclient.reconcileFiles(files, statusOpts);
@@ -830,28 +871,25 @@ public class ClientHelper extends ConnectionHelper {
 		}
 
 		// if SUBMIT
-		if (publish instanceof SubmitImpl) {
-			SubmitImpl submit = (SubmitImpl) publish;
+		if (publish instanceof SubmitImpl submit) {
 			boolean reopen = submit.isReopen();
 			long c = submitFiles(change, reopen);
 			id = Long.toString(c);
 		}
 
 		// if SHELVE
-		if (publish instanceof ShelveImpl) {
-			ShelveImpl shelve = (ShelveImpl) publish;
+		if (publish instanceof ShelveImpl shelve) {
 			boolean revert = shelve.isRevert();
 			long c = shelveFiles(change, files, revert);
 			id = Long.toString(c);
 		}
 
 		// if COMMIT
-		if (publish instanceof CommitImpl) {
-			CommitImpl commit = (CommitImpl) publish;
+		if (publish instanceof CommitImpl commit) {
 			id = commitFiles(change);
 		}
 
-		log("duration: " + timer.toString() + "\n");
+		log("duration: " + timer + "\n");
 		return id;
 	}
 
@@ -875,8 +913,7 @@ public class ClientHelper extends ConnectionHelper {
 		reopenOpts.setChangelistId(ChangeListID);
 
 		// set purge if required
-		if (publish instanceof SubmitImpl) {
-			SubmitImpl submit = (SubmitImpl) publish;
+		if (publish instanceof SubmitImpl submit) {
 			int purge = submit.getPurgeValue();
 			if (purge > 0) {
 				reopenOpts.setFileType("+S" + purge);
@@ -920,7 +957,7 @@ public class ClientHelper extends ConnectionHelper {
 		List<String> opts = new ArrayList<>();
 		opts.add("-c");
 		opts.add(String.valueOf(change.getId()));
-		String[] args = opts.toArray(new String[opts.size()]);
+		String[] args = opts.toArray(new String[0]);
 
 		Map<String, Object>[] results = getConnection().execMapCmd(CmdSpec.SUBMIT.name(), args, null);
 		for (Map<String, Object> map : results) {
@@ -993,8 +1030,41 @@ public class ClientHelper extends ConnectionHelper {
 		}
 		List<IFileSpec> dSpec = FileSpecBuilder.makeFileSpecList(depotPath);
 		List<IFileSpec> lSpec = iclient.where(dSpec);
-		String path = lSpec.get(0).getDepotPathString();
-		return path;
+
+		return getDepotPathSpecificToWorkspaceStream(lSpec);
+	}
+
+	private String getDepotPathSpecificToWorkspaceStream(List<IFileSpec> lSpec) {
+		if (null == lSpec || lSpec.isEmpty()) {
+			return "";
+		}
+		String stream = iclient.getStream();
+
+		if (null != stream && !stream.isEmpty()) {
+			try {
+				// If virtual stream, return path with parent stream name.
+				List<IStreamSummary> streamSummaries = this.getStreams(Collections.singletonList(stream));
+				if (null != streamSummaries && !streamSummaries.isEmpty()) {
+					IStreamSummary summary = streamSummaries.get(0);
+					IStreamSummary.Type type = summary.getType();
+					if (type.equals(IStreamSummary.Type.VIRTUAL)) {
+						stream = summary.getParent();
+					}
+				}
+			} catch (Exception e) {
+				// Log the exception without failing the build
+				log("P4JAVA: Error in finding type of stream. " + e);
+			}
+
+			String finalStream = stream;
+			return lSpec.stream()
+					.filter(spec -> spec != null && spec.getDepotPathString() != null)
+					.map(IFileSpec::getDepotPathString)
+					.filter(path -> path.contains(finalStream))
+					.findFirst()
+					.orElse("");
+		}
+		return lSpec.get(0).getDepotPathString();
 	}
 
 	private void deleteFile(String rev) throws Exception {
@@ -1086,7 +1156,7 @@ public class ClientHelper extends ConnectionHelper {
 			}
 		}
 
-		log("... duration: " + timer.toString());
+		log("... duration: " + timer);
 	}
 
 	/**
@@ -1119,7 +1189,7 @@ public class ClientHelper extends ConnectionHelper {
 		List<IFileSpec> rsvMsg = iclient.resolveFilesAuto(files, rsvOpts);
 		getValidate().check(rsvMsg, "no file(s) to resolve");
 
-		log("... duration: " + timer.toString());
+		log("... duration: " + timer);
 	}
 
 	/**
@@ -1201,11 +1271,7 @@ public class ClientHelper extends ConnectionHelper {
 		List<IChangelistSummary> list = getConnection().getChangelists(files, opts);
 
 		// In-line implementation of comparator because of course you can't sort changelists....
-		Collections.sort(list, new Comparator<IChangelistSummary>() {
-			public int compare(IChangelistSummary one, IChangelistSummary two) {
-				return Integer.compare(one.getId(), two.getId());
-			}
-		});
+		list.sort(Comparator.comparingInt(IChangelistSummary::getId));
 		Collections.reverse(list);
 
 		return list;
@@ -1257,12 +1323,12 @@ public class ClientHelper extends ConnectionHelper {
 		// return empty array, if from and to are equal, or Perforce will report
 		// a change
 		if (from.equals(to)) {
-			return new ArrayList<P4Ref>();
+			return new ArrayList<>();
 		}
 
 		// JENKINS-68516: skip changelist calculation if maxChanges=0.
 		if (getMaxChangeLimit() <= 0) {
-			return new ArrayList<P4Ref>();
+			return new ArrayList<>();
 		}
 
 		String ws = "//" + iclient.getName() + "/...@" + from + "," + to;
@@ -1312,7 +1378,7 @@ public class ClientHelper extends ConnectionHelper {
 	}
 
 	private List<P4Ref> listChanges(String ws) throws Exception {
-		List<P4Ref> list = new ArrayList<P4Ref>();
+		List<P4Ref> list = new ArrayList<>();
 		GetChangelistsOptions opts = new GetChangelistsOptions();
 		opts.setMaxMostRecent(getMaxChangeLimit());
 
@@ -1372,7 +1438,7 @@ public class ClientHelper extends ConnectionHelper {
 		}
 		// return empty array, if from and changeLimit are equal, or Perforce will report a change
 		if (from.equals(changeLimit)) {
-			return new ArrayList<P4Ref>();
+			return new ArrayList<>();
 		}
 
 		if (from.getChange() > 0) {
@@ -1388,7 +1454,7 @@ public class ClientHelper extends ConnectionHelper {
 	private List<P4Ref> listHaveChanges(String fileSpec) throws Exception {
 		log("P4: Polling with cstat: " + fileSpec);
 
-		List<P4Ref> haveChanges = new ArrayList<P4Ref>();
+		List<P4Ref> haveChanges = new ArrayList<>();
 		Map<String, Object>[] map;
 		map = getConnection().execMapCmd("cstat", new String[]{fileSpec}, null);
 
@@ -1414,8 +1480,7 @@ public class ClientHelper extends ConnectionHelper {
 	public boolean isClientValid(Workspace workspace) {
 		if (iclient == null) {
 			String msg;
-			if (workspace instanceof TemplateWorkspaceImpl) {
-				TemplateWorkspaceImpl template = ((TemplateWorkspaceImpl) workspace);
+			if (workspace instanceof TemplateWorkspaceImpl template) {
 				String name = template.getTemplateName();
 				msg = "P4: Template workspace not found: " + name;
 			} else {

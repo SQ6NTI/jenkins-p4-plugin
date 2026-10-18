@@ -1,6 +1,7 @@
 package org.jenkinsci.plugins.p4.unshelve;
 
 import com.perforce.p4java.core.IChangelistSummary;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
@@ -92,10 +93,7 @@ public class UnshelveBuilder extends Builder {
 					return false;
 				}
 				return unshelve(build, credential, workspace, buildWorkspace, listener);
-			} catch (IOException e) {
-				logger.warning("Unable to Unshelve");
-				e.printStackTrace();
-			} catch (InterruptedException e) {
+			} catch (IOException | InterruptedException e) {
 				logger.warning("Unable to Unshelve");
 				e.printStackTrace();
 			}
@@ -128,10 +126,10 @@ public class UnshelveBuilder extends Builder {
 
 		boolean result = buildWorkspace.act(task);
 
-		// Jenkins instance is not available on slave machine. Update changelog only after build done
+		// Jenkins instance is not available on agent machine. Update changelog only after build done
 		if (result) {
 			TagAction tagAction = run.getAction(TagAction.class);
-			updateChangeLog(task, workspace, tagAction, change);
+			updateChangeLog(task, ws, tagAction, change);
 		}
 
 		return result;
@@ -161,7 +159,7 @@ public class UnshelveBuilder extends Builder {
 	}
 
 	public static DescriptorImpl descriptor() {
-		Jenkins j = Jenkins.getInstance();
+		Jenkins j = Jenkins.get();
 		return j.getDescriptorByType(UnshelveBuilder.DescriptorImpl.class);
 	}
 
@@ -170,11 +168,11 @@ public class UnshelveBuilder extends Builder {
 	public static class DescriptorImpl extends BuildStepDescriptor<Builder> {
 
 		@Override
-		@SuppressWarnings("rawtypes")
 		public boolean isApplicable(Class<? extends AbstractProject> jobType) {
 			return true;
 		}
 
+		@NonNull
 		@Override
 		public String getDisplayName() {
 			return "Perforce: Unshelve";

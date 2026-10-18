@@ -15,6 +15,7 @@ import org.jenkinsci.plugins.p4.credentials.P4InvalidCredentialException;
 import org.jenkinsci.plugins.p4.workspace.Workspace;
 
 import java.io.IOException;
+import java.io.Serial;
 import java.io.Serializable;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -23,6 +24,7 @@ import java.util.logging.Logger;
 
 public abstract class AbstractTask implements Serializable {
 
+	@Serial
 	private static final long serialVersionUID = 1L;
 
 	private static Logger logger = Logger.getLogger(AbstractTask.class.getName());
@@ -57,16 +59,16 @@ public abstract class AbstractTask implements Serializable {
 	 * Set the workspace used for the task.
 	 * Often AbstractTask#setEnvironment() is used to expand the variables in the workspace before set
 	 *
-	 * @param workspace Perforce Workspace type
+	 * @param workspace P4 Workspace type
 	 */
 	public void setWorkspace(Workspace workspace) {
 		this.workspace = workspace;
 	}
 
 	/**
-	 * Implements the Perforce task to retry if necessary
+	 * Implements the P4 task to retry if necessary
 	 *
-	 * @param p4 Perforce connection helper
+	 * @param p4 P4 connection helper
 	 * @return Task object
 	 * @throws Exception push up stack
 	 */
@@ -99,7 +101,6 @@ public abstract class AbstractTask implements Serializable {
 		envVars.put("NODE_NAME", envVars.get("NODE_NAME", nodeName));
 		String executor = ExecutorHelper.getExecutorID(buildWorkspace, listener);
 		envVars.put("EXECUTOR_NUMBER", envVars.get("EXECUTOR_NUMBER", executor));
-
 		ws.setExpand(envVars);
 
 		// Set workspace root (check for parallel execution)
@@ -178,7 +179,7 @@ public abstract class AbstractTask implements Serializable {
 				throw new AbortException(msg);
 			}
 
-			// Check connection (might be on remote slave)
+			// Check connection (might be on remote agent)
 			if (!checkConnection(p4)) {
 				String msg = "P4: Unable to connect.";
 				logger.warning(msg);
@@ -226,7 +227,7 @@ public abstract class AbstractTask implements Serializable {
 
 				// back off n^2 seconds, before retry
 				try {
-					TimeUnit.SECONDS.sleep(t ^ 2);
+					TimeUnit.SECONDS.sleep((long) t * t);
 				} catch (InterruptedException e2) {
 					Thread.currentThread().interrupt();
 				}

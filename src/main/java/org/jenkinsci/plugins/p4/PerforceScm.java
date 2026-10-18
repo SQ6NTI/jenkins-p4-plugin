@@ -1,7 +1,9 @@
 package org.jenkinsci.plugins.p4;
 
 import com.cloudbees.plugins.credentials.CredentialsProvider;
+import com.mig82.folders.properties.PropertiesLoader;
 import com.perforce.p4java.exception.P4JavaException;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.AbortException;
 import hudson.EnvVars;
 import hudson.Extension;
@@ -12,6 +14,7 @@ import hudson.matrix.MatrixBuild;
 import hudson.matrix.MatrixConfiguration;
 import hudson.matrix.MatrixExecutionStrategy;
 import hudson.matrix.MatrixProject;
+import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.FreeStyleBuild;
 import hudson.model.Item;
@@ -31,7 +34,7 @@ import hudson.util.LogTaskListener;
 import jenkins.model.Jenkins;
 import net.sf.json.JSONException;
 import net.sf.json.JSONObject;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.multiplescms.MultiSCM;
 import org.jenkinsci.plugins.p4.browsers.P4Browser;
@@ -39,12 +42,15 @@ import org.jenkinsci.plugins.p4.browsers.SwarmBrowser;
 import org.jenkinsci.plugins.p4.build.ExecutorHelper;
 import org.jenkinsci.plugins.p4.build.NodeHelper;
 import org.jenkinsci.plugins.p4.build.P4EnvironmentContributor;
+import org.jenkinsci.plugins.p4.build.P4StreamEnvironmentContributionAction;
+import org.jenkinsci.plugins.p4.changes.P4AffectedFile;
 import org.jenkinsci.plugins.p4.changes.P4ChangeEntry;
 import org.jenkinsci.plugins.p4.changes.P4ChangeParser;
 import org.jenkinsci.plugins.p4.changes.P4ChangeRef;
 import org.jenkinsci.plugins.p4.changes.P4ChangeSet;
 import org.jenkinsci.plugins.p4.changes.P4GraphRef;
 import org.jenkinsci.plugins.p4.changes.P4LabelRef;
+import org.jenkinsci.plugins.p4.changes.P4PollRef;
 import org.jenkinsci.plugins.p4.changes.P4Ref;
 import org.jenkinsci.plugins.p4.client.ConnectionHelper;
 import org.jenkinsci.plugins.p4.credentials.P4BaseCredentials;
@@ -52,6 +58,7 @@ import org.jenkinsci.plugins.p4.credentials.P4CredentialsImpl;
 import org.jenkinsci.plugins.p4.credentials.P4InvalidCredentialException;
 import org.jenkinsci.plugins.p4.filters.Filter;
 import org.jenkinsci.plugins.p4.filters.FilterLatestChangeImpl;
+import org.jenkinsci.plugins.p4.filters.FilterPathImpl;
 import org.jenkinsci.plugins.p4.filters.FilterPerChangeImpl;
 import org.jenkinsci.plugins.p4.matrix.MatrixOptions;
 import org.jenkinsci.plugins.p4.populate.Populate;
@@ -81,13 +88,12 @@ import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.Stapler;
-import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerRequest2;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -117,6 +123,10 @@ public class PerforceScm extends SCM {
 	public static final int DEFAULT_FILE_LIMIT = 50;
 	public static final int DEFAULT_CHANGE_LIMIT = 20;
 	public static final long DEFAULT_HEAD_LIMIT = 1000;
+
+	// Max builds calculateChanges() walks back to find a build that recorded a baseline; sized to span a
+	// day-long outage of a frequently built job (e.g. every 5 minutes).
+	private static final int MAX_BASELINE_WALKBACK = 500;
 
 	public String getCredential() {
 		return credential;
@@ -159,12 +169,11 @@ public class PerforceScm extends SCM {
 		if (scm instanceof PerforceScm) {
 			perforceScm = (PerforceScm) scm;
 		} else {
-			Jenkins jenkins = Jenkins.getInstance();
+			Jenkins jenkins = Jenkins.get();
 			if (jenkins != null) {
 				Plugin multiSCMPlugin = jenkins.getPlugin("multiple-scms");
 				if (multiSCMPlugin != null) {
-					if (scm instanceof MultiSCM) {
-						MultiSCM multiSCM = (MultiSCM) scm;
+					if (scm instanceof MultiSCM multiSCM) {
 						for (SCM configuredSCM : multiSCM.getConfiguredSCMs()) {
 							if (configuredSCM instanceof PerforceScm) {
 								perforceScm = (PerforceScm) configuredSCM;
@@ -234,10 +243,11 @@ public class PerforceScm extends SCM {
 		this.revision = null;
 	}
 
+	@NonNull
 	@Override
 	public String getKey() {
 		String delim = "-";
-		StringBuffer key = new StringBuffer("p4");
+		StringBuilder key = new StringBuilder("p4");
 
 		// add Credential
 		key.append(delim);
@@ -245,29 +255,24 @@ public class PerforceScm extends SCM {
 
 		// add Mapping/Stream
 		key.append(delim);
-		if (workspace instanceof ManualWorkspaceImpl) {
-			ManualWorkspaceImpl ws = (ManualWorkspaceImpl) workspace;
+		if (workspace instanceof ManualWorkspaceImpl ws) {
 			key.append(ws.getSpec().getView());
 			key.append(ws.getSpec().getStreamName());
 			key.append(ws.getName());
 		}
-		if (workspace instanceof StreamWorkspaceImpl) {
-			StreamWorkspaceImpl ws = (StreamWorkspaceImpl) workspace;
+		if (workspace instanceof StreamWorkspaceImpl ws) {
 			key.append(ws.getStreamName());
 			key.append(ws.getStreamAtChange());
 			key.append(ws.getName());
 		}
-		if (workspace instanceof SpecWorkspaceImpl) {
-			SpecWorkspaceImpl ws = (SpecWorkspaceImpl) workspace;
+		if (workspace instanceof SpecWorkspaceImpl ws) {
 			key.append(ws.getSpecPath());
 			key.append(ws.getName());
 		}
-		if (workspace instanceof StaticWorkspaceImpl) {
-			StaticWorkspaceImpl ws = (StaticWorkspaceImpl) workspace;
+		if (workspace instanceof StaticWorkspaceImpl ws) {
 			key.append(ws.getName());
 		}
-		if (workspace instanceof TemplateWorkspaceImpl) {
-			TemplateWorkspaceImpl ws = (TemplateWorkspaceImpl) workspace;
+		if (workspace instanceof TemplateWorkspaceImpl ws) {
 			key.append(ws.getTemplateName());
 			key.append(ws.getName());
 		}
@@ -277,12 +282,12 @@ public class PerforceScm extends SCM {
 
 	public static P4Browser findBrowser(String scmCredential) {
 		// Retrieve item from request
-		StaplerRequest req = Stapler.getCurrentRequest();
+		StaplerRequest2 req = Stapler.getCurrentRequest2();
 		Job job = req == null ? null : req.findAncestorObject(Job.class);
 
 		// If cannot retrieve item, check from root
 		P4BaseCredentials credentials = job == null
-				? ConnectionHelper.findCredential(scmCredential, Jenkins.getInstance())
+				? ConnectionHelper.findCredential(scmCredential, Jenkins.get())
 				: ConnectionHelper.findCredential(scmCredential, job);
 
 		if (credentials == null) {
@@ -314,8 +319,8 @@ public class PerforceScm extends SCM {
 	 * the build as an Action for later retrieval.
 	 */
 	@Override
-	public SCMRevisionState calcRevisionsFromBuild(Run<?, ?> run, FilePath buildWorkspace, Launcher launcher,
-												   TaskListener listener) throws IOException, InterruptedException {
+	public SCMRevisionState calcRevisionsFromBuild(@NonNull Run<?, ?> run, FilePath buildWorkspace, Launcher launcher,
+	                                               @NonNull TaskListener listener) {
 		// return the Perforce change; this gets updated during polling...
 		return new PerforceRevisionState(new P4LabelRef("now"));
 	}
@@ -326,8 +331,8 @@ public class PerforceScm extends SCM {
 	 * detected by this poll.
 	 */
 	@Override
-	public PollingResult compareRemoteRevisionWith(Job<?, ?> job, Launcher launcher, FilePath buildWorkspace,
-												   TaskListener listener, SCMRevisionState baseline) throws IOException, InterruptedException {
+	public PollingResult compareRemoteRevisionWith(@NonNull Job<?, ?> job, Launcher launcher, FilePath buildWorkspace,
+	                                               @NonNull TaskListener listener, @NonNull SCMRevisionState baseline) throws IOException, InterruptedException {
 
 		String jobName = job.getName();
 		logger.finer("P4: polling[" + jobName + "] started...");
@@ -337,10 +342,9 @@ public class PerforceScm extends SCM {
 		// Get last run and build workspace
 		Run<?, ?> lastRun = job.getLastBuild();
 
-		Queue.Item[] items = Jenkins.getInstance().getQueue().getItems();
+		Queue.Item[] items = Jenkins.get().getQueue().getItems();
 		for (Queue.Item item : items) {
-			if (item.task instanceof WorkflowJob) {
-				WorkflowJob task = (WorkflowJob) item.task;
+			if (item.task instanceof WorkflowJob task) {
 				if (task.equals(job)) {
 					if (item instanceof Queue.WaitingItem) {
 						logger.info("P4: polling[" + jobName + "] skipping WaitingItem");
@@ -431,6 +435,10 @@ public class PerforceScm extends SCM {
 		ws.setRootPath(null);
 		ws.setExpand(envVars);
 
+		EnvVars folderPropertiesVars = PropertiesLoader.loadFolderProperties(lastRun.getParent());
+		if (!folderPropertiesVars.isEmpty()) {
+			folderPropertiesVars.forEach(ws::addEnv);
+		}
 		// Set EXPANDED client
 		String client = ws.getFullName();
 		listener.getLogger().println("P4: Polling on: " + nodeName + " with:" + client);
@@ -449,8 +457,7 @@ public class PerforceScm extends SCM {
 			return PollingResult.NO_CHANGES;
 		} else {
 			changes.forEach((c) -> listener.getLogger().println("P4: Polling found change: " + c));
-			if (baseline instanceof PerforceRevisionState) {
-				PerforceRevisionState p4Baseline = (PerforceRevisionState) baseline;
+			if (baseline instanceof PerforceRevisionState p4Baseline) {
 				setLatestChange(changes, listener, p4Baseline);
 			}
 			return PollingResult.BUILD_NOW;
@@ -497,18 +504,45 @@ public class PerforceScm extends SCM {
 			ws.getExpand().set(ReviewProp.P4_LABEL.toString(), pin);
 		}
 
+		// Early out if lastRun is null
+		if (lastRun == null) {
+			// no previous build, return null.
+			listener.getLogger().println("P4: Polling: No changes as no previous build exists.");
+			return null;
+		}
+
 		// Calculate last change, build if null (JENKINS-40356)
 		List<P4Ref> lastRefs = TagAction.getLastChange(lastRun, listener, syncID);
 		if (lastRefs == null || lastRefs.isEmpty()) {
-			// no previous build, return null.
-			listener.getLogger().println("P4: Polling: No changes in previous build.");
+			// Only stop the walkback if the last build actually ran p4sync for THIS workspace.
+			// If the TagAction belongs to a different workspace (syncID mismatch) or is absent
+			// (pipeline failed before reaching p4sync), walk back to find a valid baseline.
+			// (Fixes P4JENKINS-158: trigger stalls after a build that fails before p4sync)
+			TagAction tagAction = TagAction.getLastAction(lastRun);
+			if (tagAction != null && syncID.equals(tagAction.getSyncID())) {
+				// Last build did sync this workspace and found no new changes — nothing to build.
+				listener.getLogger().println("P4: Polling: No changes in previous build(s).");
+				return null;
+			}
+			// Last build had no sync for this workspace; walk back to find a usable baseline.
+			if (!lastRun.isInProgress()) {
+				Run<?, ?> previousRun = lastRun.getPreviousBuild();
+				if (previousRun != null) {
+					listener.getLogger().println("P4: Polling: last build had no sync for this workspace, walking back to previous build.");
+					return lookForChanges(buildWorkspace, ws, previousRun, listener);
+				}
+			}
+			listener.getLogger().println("P4: Polling: No changes in previous build(s).");
 			return null;
 		}
+
+		List<P4PollRef> lastPollPathRefs = TagAction.getLastPollChange(lastRun, listener, syncID);
 
 		// Create task
 		PollTask task = new PollTask(credential, lastRun, listener, filter, lastRefs);
 		task.setWorkspace(ws);
 		task.setLimit(pin);
+		task.setPollRefChanges(lastPollPathRefs);
 
 		// Execute remote task
 		List<P4Ref> changes = buildWorkspace.act(task);
@@ -521,8 +555,8 @@ public class PerforceScm extends SCM {
 	 * workspace. Authorisation
 	 */
 	@Override
-	public void checkout(Run<?, ?> run, Launcher launcher, FilePath buildWorkspace, TaskListener listener,
-						 File changelogFile, SCMRevisionState baseline) throws IOException, InterruptedException {
+	public void checkout(@NonNull Run<?, ?> run, @NonNull Launcher launcher, @NonNull FilePath buildWorkspace, @NonNull TaskListener listener,
+	                     File changelogFile, SCMRevisionState baseline) throws IOException, InterruptedException {
 
 		String jobName = run.getParent().getName();
 		logger.finer("P4: checkout[" + jobName + "] started...");
@@ -545,7 +579,6 @@ public class PerforceScm extends SCM {
 						((SyncOnlyImpl) populate).isRevert(),
 						true,
 						true,
-						populate.isModtime(),
 						populate.isQuiet(),
 						populate.getPin(),
 						populate.getParallel());
@@ -569,6 +602,10 @@ public class PerforceScm extends SCM {
 
 		// Get workspace used for the Task
 		Workspace ws = task.setEnvironment(run, workspace, buildWorkspace);
+		EnvVars folderPropertiesVars = PropertiesLoader.loadFolderProperties(run.getParent());
+		if (!folderPropertiesVars.isEmpty()) {
+			folderPropertiesVars.forEach(ws::addEnv);
+		}
 
 		// Add review to environment, if defined
 		if (review != null) {
@@ -579,6 +616,8 @@ public class PerforceScm extends SCM {
 		// Set the Workspace and initialise
 		task.setWorkspace(ws);
 		task.initialise();
+
+		setStreamEnvVariables(run, ws);
 
 		// Override build change if polling per change.
 		if (FilterPerChangeImpl.isActive(getFilter())) {
@@ -607,8 +646,7 @@ public class PerforceScm extends SCM {
 
 		// If the Latest Change filter is set, apply the baseline change to the checkout task.
 		if (FilterLatestChangeImpl.isActive(getFilter())) {
-			if (baseline instanceof PerforceRevisionState) {
-				PerforceRevisionState p4baseline = (PerforceRevisionState) baseline;
+			if (baseline instanceof PerforceRevisionState p4baseline) {
 				log.println("Baseline: " + p4baseline.getChange().toString());
 				task.setBuildChange(p4baseline.getChange());
 			}
@@ -616,14 +654,21 @@ public class PerforceScm extends SCM {
 
 		// SCMRevision build per change
 		if (revision != null) {
-			List<P4Ref> changes = Arrays.asList(revision);
+			List<P4Ref> changes = List.of(revision);
 			task.setIncrementalChanges(changes);
 		}
+
+		boolean isCustomPollingPathPresent = (ws instanceof ManualWorkspaceImpl)
+				&& ((ManualWorkspaceImpl) ws).getSpec().hasCustomPollingPaths();
 
 		// Add tagging action to build, enabling label support.
 		TagAction tag = new TagAction(run, credential);
 		tag.setWorkspace(ws);
 		tag.setRefChanges(task.getSyncChange());
+		if (isCustomPollingPathPresent) {
+			// adding the tag in the new build.xml file only when Custom Polling is enabled
+			tag.setCustomPollPathChanges(task.resolvePollPathsToLatestChanges());
+		}
 		// JENKINS-37442: Make the log file name available
 		tag.setChangelog(changelogFile);
 		// JENKINS-39107: Make Depot location of Jenkins file available
@@ -693,6 +738,22 @@ public class PerforceScm extends SCM {
 		logger.finer("P4: checkout[" + jobName + "] finished.");
 	}
 
+	private void setStreamEnvVariables(Run<?, ?> run, Workspace ws) {
+		String streamAtChange = StringUtils.EMPTY;
+		String streamName = StringUtils.EMPTY;
+		if (ws instanceof ManualWorkspaceImpl) {
+			streamAtChange = ((ManualWorkspaceImpl) ws).getSpec().getStreamAtChange();
+			streamName = ((ManualWorkspaceImpl) ws).getSpec().getStreamName();
+		}
+		if (ws instanceof StreamWorkspaceImpl) {
+			streamAtChange = ((StreamWorkspaceImpl) ws).getStreamAtChange();
+			streamName = ((StreamWorkspaceImpl) ws).getStreamName();
+		}
+		if (StringUtils.isNotBlank(streamName) || StringUtils.isNotBlank(streamAtChange)) {
+			run.addAction(new P4StreamEnvironmentContributionAction(streamName, streamAtChange));
+		}
+	}
+
 	private static Optional<TagAction> getActionWithJenkinsFilePath(Run<?, ?> run) {
 		return run.getActions(TagAction.class).stream()
 				.filter(action -> StringUtils.isNotEmpty(action.getJenkinsPath()))
@@ -710,27 +771,24 @@ public class PerforceScm extends SCM {
 			return script;
 		}
 
-		if (!(run instanceof WorkflowRun)) {
+		if (!(run instanceof WorkflowRun workflowRun)) {
 			return null;
 		}
 
-		WorkflowRun workflowRun = (WorkflowRun) run;
 		WorkflowJob job = workflowRun.getParent();
 		return getScriptPath(job);
 	}
 
 	public String getScriptPath(Item item) {
-		if (!(item instanceof WorkflowJob)) {
+		if (!(item instanceof WorkflowJob job)) {
 			return null;
 		}
 
-		WorkflowJob job = (WorkflowJob) item;
 		FlowDefinition definition = job.getDefinition();
-		if (!(definition instanceof CpsScmFlowDefinition)) {
+		if (!(definition instanceof CpsScmFlowDefinition cps)) {
 			return null;
 		}
 
-		CpsScmFlowDefinition cps = (CpsScmFlowDefinition) definition;
 		if (!(cps.getScm() instanceof PerforceScm)) {
 			return null;
 		}
@@ -760,8 +818,7 @@ public class PerforceScm extends SCM {
 
 	// Get Matrix Execution options
 	private MatrixExecutionStrategy getMatrixExecutionStrategy(Job<?, ?> job) {
-		if (job instanceof MatrixProject) {
-			MatrixProject matrixProj = (MatrixProject) job;
+		if (job instanceof MatrixProject matrixProj) {
 			return matrixProj.getExecutionStrategy();
 		}
 		return null;
@@ -779,11 +836,12 @@ public class PerforceScm extends SCM {
 	}
 
 	private List<P4ChangeEntry> calculateChanges(Run<?, ?> run, CheckoutTask task) {
-		List<P4ChangeEntry> list = new ArrayList<P4ChangeEntry>();
+		List<P4ChangeEntry> list = new ArrayList<>();
 
 		Run<?, ?> lastBuild;
 		PerforceScm.DescriptorImpl scm = getDescriptor();
-		if (scm != null && scm.isLastSuccess()) {
+		boolean sinceLastSuccess = (scm != null && scm.isLastSuccess());
+		if (sinceLastSuccess) {
 			// JENKINS-64030 Include changes since last successful build
 			lastBuild = run.getPreviousSuccessfulBuild();
 		} else {
@@ -792,10 +850,14 @@ public class PerforceScm extends SCM {
 			lastBuild = run.getPreviousCompletedBuild();
 		}
 
+		// If the previous build recorded no baseline (e.g. it failed before p4sync during an
+		// auth outage), walk back to the most recent build that did so outage-window changes aren't dropped.
 		String syncID = task.getSyncID();
-		List<P4Ref> lastRefs = TagAction.getLastChange(lastBuild, task.getListener(), syncID);
+		Run<?, ?> baseline = findBaselineBuild(lastBuild, syncID, sinceLastSuccess, MAX_BASELINE_WALKBACK);
 
-		if (lastRefs != null && !lastRefs.isEmpty()) {
+		List<P4Ref> lastRefs = TagAction.getLastChange(baseline, task.getListener(), syncID);
+
+		if (!lastRefs.isEmpty()) {
 			list.addAll(task.getChangesFull(lastRefs));
 		}
 
@@ -809,16 +871,75 @@ public class PerforceScm extends SCM {
 			}
 		}
 
-		// still empty! No previous build, so add current
-		if ((lastBuild == null) && list.isEmpty()) {
+		// still empty! No previous baseline, so add current
+		if (baseline == null && list.isEmpty()) {
+			if (lastBuild != null) {
+				task.getListener().getLogger().println("P4: no change baseline found in the previous builds (searched up to "
+						+ MAX_BASELINE_WALKBACK + "); reporting the current change only.");
+			}
 			list.add(task.getCurrentChange());
 		}
 
+		// Apply path-based filters to the change list
+		list = applyPathFilters(list);
 		return list;
 	}
 
+	/**
+	 * Find the most recent build, starting at {@code start} and walking back at most {@code maxWalkback}
+	 * builds, that recorded a TagAction for {@code syncID} (i.e. synced this workspace). A build that failed
+	 * before p4sync (e.g. during a credential outage) has none, even if another checkout in it recorded one,
+	 * so it is stepped over rather than treated as "nothing new".
+	 *
+	 * @return the baseline build, or null if there is none within the limit
+	 */
+	static Run<?, ?> findBaselineBuild(Run<?, ?> start, String syncID, boolean sinceLastSuccess, int maxWalkback) {
+		Run<?, ?> build = start;
+		for (int walked = 0; build != null && !TagAction.hasSyncID(build, syncID); walked++) {
+			if (walked == maxWalkback) {
+				return null;
+			}
+			build = sinceLastSuccess ? build.getPreviousSuccessfulBuild() : build.getPreviousCompletedBuild();
+		}
+		return build;
+	}
+
+	/**
+	 * Apply path-based filters (FilterPathImpl) to a list of change entries.
+	 * If no path filters are present the original list is returned.
+	 *
+	 * @param entries list of change entries to filter
+	 * @return filtered list of change entries (or original list if no filters)
+	 */
+	private List<P4ChangeEntry> applyPathFilters(List<P4ChangeEntry> entries) {
+		if (entries == null || entries.isEmpty() || filter == null || filter.isEmpty()) {
+			return entries;
+		}
+
+		List<P4ChangeEntry> remainder = new ArrayList<>();
+
+		for (Filter f : filter) {
+			if (!(f instanceof FilterPathImpl)) {
+				continue;
+			}
+			String filterPath = ((FilterPathImpl) f).getPath();
+
+			for (P4ChangeEntry c : entries) {
+				Collection<P4AffectedFile> affectedFiles = c.getAffectedFiles();
+				for (P4AffectedFile affectedFile : affectedFiles) {
+					String p = affectedFile.getPath();
+					if (!p.startsWith(filterPath)) {
+						remainder.add(c);
+					}
+				}
+			}
+		}
+
+		return remainder.isEmpty() ? entries : remainder;
+	}
+
 	// Post Jenkins 2.60 JENKINS-37584 JENKINS-40885 JENKINS-52806 JENKINS-60074
-	public void buildEnvironment(Run<?, ?> run, Map<String, String> env) {
+	public void buildEnvironment(@NonNull Run<?, ?> run, @NonNull Map<String, String> env) {
 		P4EnvironmentContributor.buildEnvironment(TagAction.getLastAction(run), env);
 		P4EnvironmentContributor.buildEnvironment(tagAction, env);
 	}
@@ -883,7 +1004,7 @@ public class PerforceScm extends SCM {
 	 * opportunity to perform clean up.
 	 */
 	@Override
-	public boolean processWorkspaceBeforeDeletion(Job<?, ?> job, FilePath buildWorkspace, Node node)
+	public boolean processWorkspaceBeforeDeletion(@NonNull Job<?, ?> job, @NonNull FilePath buildWorkspace, @NonNull Node node)
 			throws IOException, InterruptedException {
 
 		logger.finer("processWorkspaceBeforeDeletion");
@@ -893,6 +1014,16 @@ public class PerforceScm extends SCM {
 		if (run == null) {
 			logger.warning("P4: No previous builds found");
 			return false;
+		}
+
+		String currentNodeName = node.getNodeName();
+		if (run instanceof AbstractBuild) {
+			Node buildNode = ((AbstractBuild<?, ?>) run).getBuiltOn();
+			String buildNodeName = (buildNode != null) ? buildNode.getNodeName() : ((AbstractBuild<?, ?>) run).getBuiltOnStr();
+			if (!currentNodeName.equals(buildNodeName)) {
+				logger.warning("P4: Workspace node differs from build node, skipping cleanup");
+				return false;
+			}
 		}
 
 		// exit early if client workspace is undefined
@@ -912,15 +1043,14 @@ public class PerforceScm extends SCM {
 				return false;
 			}
 			//JENKINS-60144 Checking if the template ws exists before deleting client, otherwise it throws exception along the line.
-			if (workspace instanceof TemplateWorkspaceImpl) {
-				TemplateWorkspaceImpl template = (TemplateWorkspaceImpl) workspace;
+			if (workspace instanceof TemplateWorkspaceImpl template) {
 				boolean exists = template.templateExists(connection.getConnection());
 				if (!exists) {
 					return false;
 				}
 			}
 		} catch (Exception e) {
-			logger.warning("P4: Not able to get connection");
+			logger.warning("P4: Not able to get connection: " + e.getMessage());
 			return false;
 		}
 
@@ -928,8 +1058,8 @@ public class PerforceScm extends SCM {
 		RemoveClientTask task = new RemoveClientTask(credential, job, listener);
 
 		// Set workspace used for the Task
-		Workspace ws = task.setEnvironment(run, workspace, buildWorkspace);
-		task.setWorkspace(ws);
+		task.setEnvironment(run, workspace, buildWorkspace);
+		task.setWorkspace(workspace);
 
 		boolean clean = buildWorkspace.act(task);
 
@@ -974,6 +1104,8 @@ public class PerforceScm extends SCM {
 		private long headLimit = DEFAULT_HEAD_LIMIT;
 
 		private boolean lastSuccess;
+
+		private boolean recursionInPolling;
 
 		public boolean isAutoSave() {
 			return autoSave;
@@ -1031,6 +1163,14 @@ public class PerforceScm extends SCM {
 			this.lastSuccess = lastSuccess;
 		}
 
+		public boolean isRecursionInPolling() {
+			return recursionInPolling;
+		}
+
+		public void setRecursionInPolling(boolean recursionInPolling) {
+			this.recursionInPolling = recursionInPolling;
+		}
+
 		/**
 		 * public no-argument constructor
 		 */
@@ -1043,6 +1183,7 @@ public class PerforceScm extends SCM {
 		 * Returns the name of the SCM, this is the name that will show up next
 		 * to CVS and Subversion when configuring a job.
 		 */
+		@NonNull
 		@Override
 		public String getDisplayName() {
 			return "Perforce Software";
@@ -1054,7 +1195,7 @@ public class PerforceScm extends SCM {
 		}
 
 		@Override
-		public SCM newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+		public SCM newInstance(StaplerRequest2 req, @NonNull JSONObject formData) throws FormException {
 			PerforceScm scm = (PerforceScm) super.newInstance(req, formData);
 			return scm;
 		}
@@ -1067,7 +1208,7 @@ public class PerforceScm extends SCM {
 		 * defined in the global.jelly page.
 		 */
 		@Override
-		public boolean configure(StaplerRequest req, JSONObject json) throws FormException {
+		public boolean configure(StaplerRequest2 req, JSONObject json) {
 
 			try {
 				autoSave = json.getBoolean("autoSave");
@@ -1119,6 +1260,13 @@ public class PerforceScm extends SCM {
 				logger.info("Unable to read Reporting options in configuration");
 				lastSuccess = false;
 				hideMessages = false;
+			}
+
+			try {
+				recursionInPolling = json.getBoolean("recursionInPolling");
+			} catch (JSONException e) {
+				logger.info("Unable to read Polling options in configuration");
+				recursionInPolling = false;
 			}
 
 			save();

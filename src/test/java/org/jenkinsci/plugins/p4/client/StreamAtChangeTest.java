@@ -18,20 +18,25 @@ import hudson.model.FreeStyleProject;
 import hudson.model.Result;
 import org.jenkinsci.plugins.p4.DefaultEnvironment;
 import org.jenkinsci.plugins.p4.PerforceScm;
-import org.jenkinsci.plugins.p4.SampleServerRule;
+import org.jenkinsci.plugins.p4.SampleServerExtension;
 import org.jenkinsci.plugins.p4.credentials.P4PasswordImpl;
 import org.jenkinsci.plugins.p4.populate.AutoCleanImpl;
 import org.jenkinsci.plugins.p4.populate.Populate;
 import org.jenkinsci.plugins.p4.workspace.ManualWorkspaceImpl;
 import org.jenkinsci.plugins.p4.workspace.SpecWorkspaceImpl;
+import org.jenkinsci.plugins.p4.workspace.StreamWorkspaceImpl;
 import org.jenkinsci.plugins.p4.workspace.WorkspaceDescriptor;
 import org.jenkinsci.plugins.p4.workspace.WorkspaceSpec;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.ClassRule;
-import org.junit.Rule;
-import org.junit.Test;
+import org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition;
+import org.jenkinsci.plugins.workflow.job.WorkflowJob;
+import org.jenkinsci.plugins.workflow.job.WorkflowRun;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -39,43 +44,47 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
-import java.util.stream.Collectors;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-public class StreamAtChangeTest extends DefaultEnvironment {
+@WithJenkins
+class StreamAtChangeTest extends DefaultEnvironment {
 
 	private static final String P4ROOT = "tmp-WorkspaceSpecTest-p4root";
 	private P4PasswordImpl credentials;
 	private ConnectionHelper p4;
 	private IOptionsServer server;
 
-	@ClassRule
-	public static JenkinsRule jenkins = new JenkinsRule();
+	private static JenkinsRule jenkins;
 
-	@Rule
-	public SampleServerRule p4d = new SampleServerRule(P4ROOT, R19_1);
+	@RegisterExtension
+	private final SampleServerExtension p4d = new SampleServerExtension(P4ROOT, R24_1_r17);
 
-	@Before
-	public void buildCredentials() throws Exception {
+    @BeforeAll
+    static void beforeAll(JenkinsRule rule) {
+        jenkins = rule;
+    }
+
+    @BeforeEach
+    void beforeEach() throws Exception {
 		credentials = createCredentials("jenkins", "Password", p4d.getRshPort(), CREDENTIAL);
 		p4 = new ConnectionHelper(credentials);
 		server = p4.getConnection();
 	}
 
-	@After
-	public void tearDown() {
+	@AfterEach
+	void afterEach() {
 		if (p4 != null) {
 			p4.disconnect();
 		}
 	}
 
 	@Test
-	public void testStreamAtChange() throws Exception {
+	void testStreamAtChange() throws Exception {
 		submitFile(jenkins, "//depot/streamAtChange/depotFile", "This is first file.");
 		//Create two version of a stream
-		String streamPath = createStream();
+		String streamPath = createStream("//stream/atChange", "atChange");
 
 		//Get change number for the stream updates
 		List<String> path = new ArrayList<>();
@@ -84,7 +93,7 @@ public class StreamAtChangeTest extends DefaultEnvironment {
 		List<Integer> collect = streamLog.values().stream()
 				.flatMap(Collection::stream)
 				.map(IStreamlog::getChange)
-				.sorted().collect(Collectors.toList());
+				.sorted().toList();
 		int firstVersion = collect.get(0);
 		int secondVersion = collect.get(1);
 
@@ -100,10 +109,10 @@ public class StreamAtChangeTest extends DefaultEnvironment {
 	}
 
 	@Test
-	public void testFreeStyleProject_SpecWs() throws Exception {
+	void testFreeStyleProject_SpecWs() throws Exception {
 		submitFile(jenkins, "//depot/streamAtChange/depotFile", "This is first file.");
 		//Create two version of a stream
-		String streamPath = createStream();
+		String streamPath = createStream("//stream/atChange", "atChange");
 
 		//Get change number for the stream updates
 		List<String> path = new ArrayList<>();
@@ -112,7 +121,7 @@ public class StreamAtChangeTest extends DefaultEnvironment {
 		List<Integer> collect = streamLog.values().stream()
 				.flatMap(Collection::stream)
 				.map(IStreamlog::getChange)
-				.sorted().collect(Collectors.toList());
+				.sorted().toList();
 		int secondVersion = collect.get(1);
 
 		String stream = "//stream/atChange";
@@ -127,7 +136,7 @@ public class StreamAtChangeTest extends DefaultEnvironment {
 				+ "Options:	noallwrite noclobber nocompress unlocked nomodtime rmdir\n"
 				+ "SubmitOptions: submitunchanged\n"
 				+ "LineEnd:	local\n"
-				+ "Stream: "+stream+"\n"
+				+ "Stream: " + stream + "\n"
 				+ "StreamAtChange: " + secondVersion + "\n";
 
 		submitFile(jenkins, specPath, specFile);
@@ -153,17 +162,62 @@ public class StreamAtChangeTest extends DefaultEnvironment {
 		jenkins.assertLogContains("//depot/streamAtChange/depotFile", build);
 	}
 
-	private String createStream() throws P4JavaException {
+	@Test
+	void testP4_STREAM_Variable() throws Exception {
+		String streamName = createStream("//stream/main", "main");
+
+		//Get change number for the stream updates
+		List<String> path = new ArrayList<>();
+		path.add(streamName);
+		Map<String, List<IStreamlog>> streamLog = server.getStreamlog(path, new StreamlogOptions());
+		List<Integer> collect = streamLog.values().stream()
+				.flatMap(Collection::stream)
+				.map(IStreamlog::getChange)
+				.sorted().toList();
+		int secondVersion = collect.get(1);
+
+		String pipeline = ""
+				+ "pipeline {\n"
+				+ "  agent any\n"
+				+ "  stages {\n"
+				+ "    stage('Test') {\n"
+				+ "      steps {\n"
+				+ "        echo \"The stream name is: ${P4_STREAM}\"\n"
+				+ "        echo \"The stream at change is: ${P4_STREAM_AT_CHANGE}\"\n"
+				+ "      }\n"
+				+ "    }\n"
+				+ "  }\n"
+				+ "}";
+
+		submitStreamFile(jenkins, streamName + "/Jenkinsfile", pipeline, "description");
+
+		StreamWorkspaceImpl workspace = new StreamWorkspaceImpl("none", false, streamName, "jenkins-${NODE_NAME}-${JOB_NAME}.ws");
+		workspace.setStreamAtChange(String.valueOf(secondVersion));
+		PerforceScm scm = new PerforceScm(CREDENTIAL, workspace, new AutoCleanImpl());
+
+		WorkflowJob job = jenkins.jenkins.createProject(WorkflowJob.class, "StreamNameEnvVariable");
+		CpsScmFlowDefinition cpsScmFlowDefinition = new CpsScmFlowDefinition(scm, "Jenkinsfile");
+		cpsScmFlowDefinition.setLightweight(false);
+		job.setDefinition(cpsScmFlowDefinition);
+
+		WorkflowRun run1 = job.scheduleBuild2(0).get();
+		jenkins.assertBuildStatusSuccess(run1);
+		jenkins.assertLogContains("The stream name is: " + streamName, run1);
+		jenkins.assertLogContains("The stream at change is: " + secondVersion, run1);
+
+	}
+
+	private String createStream(String streamPath, String streamName) throws P4JavaException {
 		//1 . Create stream depot
-		Depot depot = new Depot("stream", server.getUserName(), null, "Stream Depot", IDepot.DepotType.STREAM, null, null, "//stream/...");
+		Depot depot = new Depot("stream", server.getUserName(), null, "Stream Depot", IDepot.DepotType.STREAM, null, null, "stream/...");
 		server.createDepot(depot);
 
 		//2. Create stream
-		String streamPath = "//stream/atChange";
 		IStream stream = new Stream();
 		stream.setOwnerName(server.getUserName());
+		stream.setOwnerName(server.getUserName());
 		stream.setStream(streamPath);
-		stream.setName("atChange");
+		stream.setName(streamName);
 		stream.setType(IStreamSummary.Type.MAINLINE);
 
 		ViewMap<IStreamViewMapping> streamView = new ViewMap<>();

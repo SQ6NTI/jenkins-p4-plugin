@@ -1,5 +1,7 @@
 package org.jenkinsci.plugins.p4.build;
 
+import com.mig82.folders.properties.PropertiesLoader;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.model.Descriptor;
@@ -8,22 +10,35 @@ import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.scm.SCM;
 import jenkins.model.Jenkins;
-import org.apache.commons.lang.StringUtils;
+import jenkins.scm.api.SCMHead;
+import jenkins.scm.api.SCMRevision;
+import jenkins.scm.api.SCMRevisionAction;
+import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.plugins.p4.PerforceScm;
 import org.jenkinsci.plugins.p4.review.P4Review;
+import org.jenkinsci.plugins.p4.review.ReviewProp;
+import org.jenkinsci.plugins.p4.scm.P4SCMHead;
+import org.jenkinsci.plugins.p4.scm.P4SCMRevision;
 import org.jenkinsci.plugins.p4.tagging.TagAction;
 import org.jenkinsci.plugins.p4.workspace.Workspace;
 
-import java.io.IOException;
+import java.util.List;
 import java.util.Map;
+import java.util.logging.Logger;
 
 @Extension()
 public class P4EnvironmentContributor extends EnvironmentContributor {
+	private static Logger logger = Logger.getLogger(P4EnvironmentContributor.class.getName());
 
 	@Override
-	public void buildEnvironmentFor(Run run, EnvVars env, TaskListener listener) throws IOException, InterruptedException {
+	public void buildEnvironmentFor(@NonNull Run run, @NonNull EnvVars env, @NonNull TaskListener listener) {
 		TagAction tagAction = TagAction.getLastAction(run);
 		buildEnvironment(tagAction, env);
+		injectSwarmEnvVars(run, env);
+		EnvVars folderPropertiesVars = PropertiesLoader.loadFolderProperties(run.getParent());
+		if (!folderPropertiesVars.isEmpty()) {
+			env.putAll(folderPropertiesVars);
+		}
 	}
 
 	public static void buildEnvironment(TagAction tagAction, Map<String, String> map) {
@@ -78,7 +93,7 @@ public class P4EnvironmentContributor extends EnvironmentContributor {
 		}
 
 		// Set P4_TICKET connection
-		Jenkins j = Jenkins.getInstance();
+		Jenkins j = Jenkins.get();
 		if (j != null) {
 			@SuppressWarnings("unchecked")
 			Descriptor<SCM> scm = j.getDescriptor(PerforceScm.class);
@@ -104,6 +119,38 @@ public class P4EnvironmentContributor extends EnvironmentContributor {
 		if (tagAction.getJenkinsPath() != null) {
 			String jenkinsPath = tagAction.getJenkinsPath();
 			env.put("JENKINSFILE_PATH", jenkinsPath);
+		}
+	}
+
+	private static void injectSwarmEnvVars(Run run, EnvVars env) {
+		List<SCMRevisionAction> actions = run.getActions(SCMRevisionAction.class);
+
+		for (SCMRevisionAction action : actions) {
+			if (action == null) {
+				continue;
+			}
+			SCMRevision revision = action.getRevision();
+			if (!(revision instanceof P4SCMRevision)) {
+				continue;
+			}
+
+			SCMHead head = revision.getHead();
+			if (!(head instanceof P4SCMHead)) {
+				continue;
+			}
+			Map<String, String> swarmParameters = ((P4SCMHead) head).getSwarmParams();
+
+			if (swarmParameters == null || swarmParameters.isEmpty()) {
+				continue;
+			}
+			String swarmBranch = swarmParameters.get(ReviewProp.SWARM_BRANCH.toString());
+			if (StringUtils.isNotEmpty(swarmBranch)) {
+				env.put("P4_SWARM_BRANCH", swarmBranch);
+			}
+			String change = swarmParameters.get(ReviewProp.P4_CHANGE.toString());
+			if (StringUtils.isNotEmpty(change)) {
+				env.put("P4_EVENT_CHANGE", change);
+			}
 		}
 	}
 }

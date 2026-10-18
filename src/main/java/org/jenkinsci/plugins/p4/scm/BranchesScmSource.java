@@ -4,10 +4,12 @@ import com.perforce.p4java.core.file.IFileSpec;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.model.TaskListener;
+import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.p4.browsers.P4Browser;
 import org.jenkinsci.plugins.p4.client.ConnectionHelper;
 import org.jenkinsci.plugins.p4.client.ViewMapHelper;
+import org.jenkinsci.plugins.p4.utils.FolderPropertiesUtil;
 import org.jenkinsci.plugins.p4.workspace.ManualWorkspaceImpl;
 import org.jenkinsci.plugins.p4.workspace.Workspace;
 import org.jenkinsci.plugins.p4.workspace.WorkspaceSpec;
@@ -15,14 +17,17 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class BranchesScmSource extends AbstractP4ScmSource {
 
 	private P4Browser browser;
 	private String pattern = DescriptorImpl.defaultPattern;
 	private String mappings = DescriptorImpl.defaultPath;
+	private boolean useNewDirectoryStructure = false;
 
 	@DataBoundConstructor
 	public BranchesScmSource(String credential, String includes, String charset, String format) {
@@ -40,6 +45,15 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 	@DataBoundSetter
 	public void setPattern(String pattern) {
 		this.pattern = pattern;
+	}
+
+	public boolean isUseNewDirectoryStructure() {
+		return this.useNewDirectoryStructure;
+	}
+
+	@DataBoundSetter
+	public void setUseNewDirectoryStructure(boolean useNewDirectoryStructure) {
+		this.useNewDirectoryStructure = useNewDirectoryStructure;
 	}
 
 	public String getPattern() {
@@ -66,7 +80,7 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 	}
 
 	@Override
-	public List<P4SCMHead> getTags(@NonNull TaskListener listener) throws Exception {
+	public List<P4SCMHead> getTags(@NonNull TaskListener listener) {
 		return new ArrayList<>();
 	}
 
@@ -75,18 +89,32 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 
 		Pattern excludesPattern = Pattern.compile(getExcludes());
 		List<String> paths = getIncludePaths();
+		if (pathContainsFolderPropertyVar(paths)) {
+			paths = FolderPropertiesUtil.processFolderPropertiesIn(paths, getOwner());
+		}
+
 		List<P4SCMHead> list = new ArrayList<>();
 
 		try (ConnectionHelper p4 = new ConnectionHelper(getOwner(), getCredential(), listener)) {
 			String actualPattern = getPattern();
-			if (getPattern() == null || getPattern().trim().equals("")) {
+			if (getPattern() == null || getPattern().trim().isEmpty()) {
 				actualPattern = ".*";
 			}
 			Pattern filterPattern = Pattern.compile(actualPattern);
 
+			int indexOfBranch = -1;
+			if (this.isUseNewDirectoryStructure() && !paths.get(0).endsWith("*")) {
+				indexOfBranch = Arrays.stream(paths.get(0).split("/"))
+						.filter(StringUtils::isNotEmpty)
+						.collect(Collectors.toList()).indexOf("*");
+			}
+
 			List<IFileSpec> specs = p4.getDirs(paths);
 			for (IFileSpec s : specs) {
 				String branch = s.getOriginalPathString();
+				if (this.isUseNewDirectoryStructure()) {
+					branch = branch.substring(0, branch.lastIndexOf("/"));
+				}
 
 				// check the branch is not empty
 				if (branch == null || branch.isEmpty()) {
@@ -105,6 +133,13 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 
 				// get filename and check for null
 				String file = branch.substring(branch.lastIndexOf("/") + 1);
+				if (this.isUseNewDirectoryStructure() && indexOfBranch != -1) {
+					file = Arrays.stream(branch.split("/"))
+							.filter(StringUtils::isNotEmpty)
+							.collect(Collectors.toList())
+							.get(indexOfBranch);
+
+				}
 				if (file == null || file.isEmpty()) {
 					continue;
 				}
@@ -130,12 +165,9 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 		List<String> localViews = getLocalPathMappings(path);
 
 		// If there is only one view for external/local then external is treated as local
-		boolean external = false;
-		if ((externalViews.size() + localViews.size()) > 1) {
-			external = true;
-		}
+		boolean external = (externalViews.size() + localViews.size()) > 1;
 
-		StringBuffer view = new StringBuffer();
+		StringBuilder view = new StringBuilder();
 		String client = getFormat();
 
 		String jenkinsView = ViewMapHelper.getScriptView(path.getPath(), getScriptPathOrDefault(), client);
@@ -174,7 +206,7 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 
 		for (String mapping : getViewMappings()) {
 			if (!mapping.startsWith("//")) {
-				StringBuffer sb = new StringBuffer();
+				StringBuilder sb = new StringBuilder();
 				sb.append(path.getPath());
 				sb.append("/");
 				sb.append(mapping);
@@ -192,6 +224,7 @@ public class BranchesScmSource extends AbstractP4ScmSource {
 
 		public static final String defaultPattern = ".*";
 
+		@NonNull
 		@Override
 		public String getDisplayName() {
 			return "Helix Branches";

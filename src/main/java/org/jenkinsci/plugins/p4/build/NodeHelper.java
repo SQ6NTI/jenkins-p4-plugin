@@ -43,7 +43,7 @@ public class NodeHelper {
 	}
 
 	/**
-	 * Helper: find the Node for slave build or return current instance.
+	 * Helper: find the Node for agent build or return current instance.
 	 *
 	 * @param workspace Jenkins workspace on build node
 	 * @return Node
@@ -53,6 +53,6 @@ public class NodeHelper {
 		if (computer != null) {
 			return computer.getNode();
 		}
-		return Jenkins.getInstance();
+		return Jenkins.get();
 	}
 }

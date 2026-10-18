@@ -6,18 +6,20 @@ import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.remoting.VirtualChannel;
 import jenkins.security.Roles;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.plugins.p4.client.ClientHelper;
 import org.jenkinsci.plugins.p4.publish.Publish;
 import org.jenkinsci.remoting.RoleChecker;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.Serial;
 import java.io.Serializable;
 import java.util.logging.Logger;
 
 public class PublishTask extends AbstractTask implements FileCallable<String>, Serializable {
 
+	@Serial
 	private static final long serialVersionUID = 1L;
 
 	private static Logger logger = Logger.getLogger(PublishTask.class.getName());
@@ -37,7 +39,7 @@ public class PublishTask extends AbstractTask implements FileCallable<String>, S
 	public Object task(ClientHelper p4) throws Exception {
 		String publishedChangeID = StringUtils.EMPTY;
 		try {
-			// Check connection (might be on remote slave)
+			// Check connection (might be on remote agent)
 			if (!checkConnection(p4)) {
 				return StringUtils.EMPTY;
 			}
